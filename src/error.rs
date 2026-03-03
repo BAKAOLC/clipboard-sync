@@ -31,6 +31,9 @@ pub enum MyError {
     #[error("{0}")]
     Arboard(#[from] arboard::Error),
 
+    #[error("x11-clipboard error: {0}")]
+    X11Clipboard(String),
+
     #[error("No clipboards.")]
     NoClipboards,
 

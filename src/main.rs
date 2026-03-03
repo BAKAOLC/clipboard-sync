@@ -17,6 +17,7 @@ mod error;
 mod log;
 mod mustatex;
 mod sync;
+mod zombies;
 
 fn main() {
     let args = Args::parse();
@@ -90,6 +91,7 @@ fn run_forked() {
 
 fn run() {
     log::info!("starting clipboard sync");
+    zombies::spawn_reaper();
     loop_with_error_pain_management(
         sync::get_clipboards().unwrap(),
         |cb| sync::keep_synced(cb),
