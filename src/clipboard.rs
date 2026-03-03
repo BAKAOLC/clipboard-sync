@@ -63,6 +63,44 @@ pub fn is_text_mime(mime: &str) -> bool {
         || matches!(mime, "UTF8_STRING" | "STRING" | "TEXT" | "COMPOUND_TEXT")
 }
 
+/// Returns `true` only for MIME types that represent meaningful rich binary
+/// content (images, etc.) worth preserving in a single-MIME write.
+/// Browser-internal opaque tokens (e.g. `chromium/*`) are intentionally
+/// excluded — they carry no meaning outside the originating application.
+fn is_rich_binary_mime(mime: &str) -> bool {
+    mime.starts_with("image/")
+}
+
+/// Choose the best single MIME entry to write when a backend can only expose
+/// one MIME type at a time (wl-copy, x11-clipboard `store()`).
+///
+/// Priority:
+/// 1. Rich binary content (`image/*`)  — preserve fidelity.
+/// 2. Plain text (`text/plain*` / `UTF8_STRING` / `STRING`) — preferred over HTML.
+/// 3. `data.text()` decoded as `text/plain;charset=utf-8`.
+/// 4. First available entry as last resort.
+///
+/// This prevents `text/html` and browser-internal tokens (e.g. `chromium/*`)
+/// from being selected ahead of plain-text when pasting into normal text fields.
+fn select_single_write_mime(data: &ClipboardData) -> Option<(String, Vec<u8>)> {
+    // 1. Image / rich binary takes absolute priority.
+    if let Some(entry) = data.entries.iter().find(|e| is_rich_binary_mime(&e.mime_type)) {
+        return Some((entry.mime_type.clone(), entry.data.clone()));
+    }
+    // 2. Prefer plain text over HTML and other rich-text types.
+    for preferred in &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"] {
+        if let Some(bytes) = data.get_mime(preferred) {
+            return Some(((*preferred).to_string(), bytes.to_vec()));
+        }
+    }
+    // 3. Generic text() fallback (handles TEXT, COMPOUND_TEXT, etc.).
+    if let Some(text) = data.text() {
+        return Some(("text/plain;charset=utf-8".to_string(), text.into_bytes()));
+    }
+    // 4. First entry, whatever it is.
+    data.entries.first().map(|e| (e.mime_type.clone(), e.data.clone()))
+}
+
 // ---------------------------------------------------------------------------
 // MIME-type discovery helpers
 // ---------------------------------------------------------------------------
@@ -450,8 +488,28 @@ impl Clipboard for WlrClipboard {
         let _guard = lock_display_env();
         unsafe { env::set_var("WAYLAND_DISPLAY", &self.display) };
 
-        // Keep only Wayland-native MIME types (skip X11-specific atoms).
-        let entries: Vec<(Vec<u8>, String)> = data
+        // Keep only Wayland-native MIME types (skip X11-specific atoms), then
+        // reorder so plain text comes BEFORE text/html.
+        // Wayland applications iterate TARGETS in advertised order and pick the
+        // first type they can handle; placing text/html ahead of text/plain
+        // causes ordinary text fields to receive raw HTML markup instead of
+        // the human-readable string.
+        //
+        // Write order priority:
+        //   1. image/* and other true binary types  — preserve rich content
+        //   2. text/plain* (plain text)             — preferred over HTML
+        //   3. text/uri-list                        — file/URL drops
+        //   4. text/html                            — rich text, last resort
+        //   5. everything else (browser tokens etc.)
+        fn write_order(mime: &str) -> u8 {
+            if mime.starts_with("image/") { return 0; }
+            if mime == "text/plain;charset=utf-8" || mime == "text/plain" { return 1; }
+            if mime == "text/uri-list" { return 2; }
+            if mime == "text/html" { return 3; }
+            4
+        }
+
+        let mut entries: Vec<(Vec<u8>, String)> = data
             .entries
             .iter()
             .filter(|e| {
@@ -462,6 +520,7 @@ impl Clipboard for WlrClipboard {
             })
             .map(|e| (e.data.clone(), e.mime_type.clone()))
             .collect();
+        entries.sort_by_key(|(_, mime)| write_order(mime.as_str()));
 
         if entries.is_empty() {
             // All entries were X11-only atoms; fall back to plain text.
@@ -553,29 +612,21 @@ impl Clipboard for WlCommandClipboard {
             return Ok(());
         }
 
-        // wl-copy accepts only one MIME type at a time; pick the first
-        // Wayland-native entry (skip X11-specific atoms).
-        let entry = data
-            .entries
-            .iter()
-            .find(|e| {
-                !matches!(e.mime_type.as_str(), "UTF8_STRING" | "STRING" | "TEXT")
-            })
-            .or_else(|| data.entries.first());
-
-        let Some(entry) = entry else {
+        // wl-copy accepts only one MIME type at a time; delegate selection to
+        // the shared helper which prefers plain text over HTML / browser tokens.
+        let Some((mime_type, bytes)) = select_single_write_mime(data) else {
             return Ok(());
         };
 
         use std::io::Write;
         use std::process::Stdio;
         let mut child = Command::new("wl-copy")
-            .args(["--type", &entry.mime_type])
+            .args(["--type", mime_type.as_str()])
             .env("WAYLAND_DISPLAY", &self.display)
             .stdin(Stdio::piped())
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&entry.data)?;
+            stdin.write_all(&bytes)?;
         }
 
         Ok(())
@@ -742,34 +793,23 @@ impl Clipboard for X11ClipboardDirect {
         }
         let cb = &self.inner;
 
-        // x11-clipboard's store() replaces the entire X11 selection owner on
-        // each call, so storing multiple entries sequentially leaves only the
-        // last one visible via TARGETS.  To avoid losing earlier binary/rich
-        // MIME types, store exactly ONE entry: the highest-priority entry that
-        // maps to a real X11 atom (prefer non-text-atom MIME types first).
-        let entry = data
-            .entries
-            .iter()
-            .find(|e| {
-                !matches!(
-                    e.mime_type.as_str(),
-                    "UTF8_STRING" | "STRING" | "TEXT" | "COMPOUND_TEXT"
-                )
-            })
-            .or_else(|| data.entries.first());
-
-        let Some(entry) = entry else {
+        // x11-clipboard's store() replaces the entire selection owner on each
+        // call — only one MIME is visible at a time.  Delegate the selection to
+        // the shared helper that correctly prioritises plain text over HTML and
+        // browser-internal opaque tokens (e.g. chromium/*).
+        let Some((mime_type, bytes)) = select_single_write_mime(data) else {
             return Ok(());
         };
 
-        let atom = match entry.mime_type.as_str() {
-            "UTF8_STRING" => cb.setter.atoms.utf8_string,
+        let atom = match mime_type.as_str() {
+            "UTF8_STRING" | "text/plain" | "text/plain;charset=utf-8" => {
+                cb.setter.atoms.utf8_string
+            }
             "STRING" | "TEXT" => cb.setter.atoms.string,
-            "text/plain" | "text/plain;charset=utf-8" => cb.setter.atoms.utf8_string,
             other => match Self::intern_atom(cb, other) {
                 Some(a) => a,
                 None => {
-                    // Atom not available on this display; fall back to text.
+                    // Atom not available on this display; fall back to plain text.
                     if let Some(text) = data.text() {
                         cb.store(
                             cb.setter.atoms.clipboard,
@@ -783,7 +823,7 @@ impl Clipboard for X11ClipboardDirect {
             },
         };
 
-        cb.store(cb.setter.atoms.clipboard, atom, entry.data.as_slice())
+        cb.store(cb.setter.atoms.clipboard, atom, bytes)
             .map_err(|e| MyError::X11Clipboard(e.to_string()))?;
 
         Ok(())
