@@ -1,9 +1,9 @@
-prefix := "/usr/local"
-bin := "bin"
-systemd := "lib/systemd"
-user_unit_dir := "$(systemd)/user"
-profile := "release"
-version := $(shell grep '^version' Cargo.toml | sed 's/version = "(.*)"/\1/g')
+prefix := /usr/local
+bin := bin
+systemd := lib/systemd
+user_unit_dir := $(systemd)/user
+profile := release
+version := $(shell grep '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/g')
 deb_version := $(shell grep Version control | sed 's/Version: *//g')
 
 build:
@@ -11,7 +11,9 @@ build:
 
 install:
 	install -Dm755 target/$(profile)/clipboard-sync "$(prefix)/$(bin)/clipboard-sync"
-	install -Dm644 clipboard-sync.service "$(prefix)/$(user_unit_dir)/clipboard-sync.service"
+	sed 's|@BINDIR@|$(prefix)/$(bin)|g' clipboard-sync.service > /tmp/clipboard-sync.service.tmp
+	install -Dm644 /tmp/clipboard-sync.service.tmp "$(prefix)/$(user_unit_dir)/clipboard-sync.service"
+	rm -f /tmp/clipboard-sync.service.tmp
 
 uninstall:
 	rm -f "$(prefix)/$(bin)/clipboard-sync"
